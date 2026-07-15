@@ -25,8 +25,8 @@ BONE_ALIASES = {
     "head": ("head",),
     "chest": ("chest", "upperchest", "spine2", "spine_02", "spine02"),
     "hips": ("hips", "pelvis", "hip"),
-    "thigh_l": ("leftupleg", "thigh_l", "upperleg_l", "upleg_l"),
-    "thigh_r": ("rightupleg", "thigh_r", "upperleg_r", "upleg_r"),
+    "thigh_l": ("leftupperleg", "leftupleg", "thigh_l", "upperleg_l", "upleg_l"),
+    "thigh_r": ("rightupperleg", "rightupleg", "thigh_r", "upperleg_r", "upleg_r"),
 }
 
 GODOT_PROFILE_BONES = {

@@ -1,5 +1,6 @@
 """Headless regression for the semi-automatic root-to-tip hair guide workflow."""
 
+import json
 import math
 import pathlib
 import sys
@@ -26,8 +27,8 @@ def build_rig(scene):
         ("mixamorig:Hips", (0, 0, 0.9), (0, 0, 1.1), "GameRoot"),
         ("mixamorig:Spine2", (0, 0, 1.1), (0, 0, 1.55), "mixamorig:Hips"),
         ("mixamorig:Head", (0, 0, 1.55), (0, 0, 1.9), "mixamorig:Spine2"),
-        ("mixamorig:LeftUpLeg", (0.1, 0, 0.95), (0.1, 0, 0.5), "mixamorig:Hips"),
-        ("mixamorig:RightUpLeg", (-0.1, 0, 0.95), (-0.1, 0, 0.5), "mixamorig:Hips"),
+        ("LeftUpperLeg", (0.1, 0, 0.95), (0.1, 0, 0.5), "mixamorig:Hips"),
+        ("RightUpperLeg", (-0.1, 0, 0.95), (-0.1, 0, 0.5), "mixamorig:Hips"),
     )
     for name, head, tail, parent in specs:
         bone = data.edit_bones.new(name)
@@ -103,6 +104,7 @@ def main():
     assert sum(1 for vertex in hair.data.vertices if not vertex.groups) == 0
     assert max(len(vertex.groups) for vertex in hair.data.vertices) <= 4
     assert bpy.ops.gsmb.validate_production_equipment() == {"FINISHED"}
+    assert len(json.loads(equipment["gsmb_collider_names"])) == 5
     print("GSMB_HAIR_GUIDES_SMOKE_OK guides=1 bones=4 unweighted=0 max_influences=4")
 
 
