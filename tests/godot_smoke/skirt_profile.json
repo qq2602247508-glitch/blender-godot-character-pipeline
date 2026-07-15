@@ -1,0 +1,30 @@
+{
+  "schema": "gsmb-secondary-motion-v1",
+  "asset_id": "skirt_smoke",
+  "equipment_type": "SKIRT",
+  "skeleton_version": "HERO_RIG_V1",
+  "retarget": {
+    "profile": "SkeletonProfileHumanoid",
+    "position": true,
+    "rotation": true,
+    "scale": false,
+    "use_global_pose": false
+  },
+  "chains": [
+    {
+      "root": "GSMB_Skirt_01_01",
+      "end": "GSMB_Skirt_01_03",
+      "joints": ["GSMB_Skirt_01_01", "GSMB_Skirt_01_02", "GSMB_Skirt_01_03"],
+      "stiffness": 0.45,
+      "drag": 0.7,
+      "gravity": 0.35,
+      "gravity_direction": [0.0, -1.0, 0.0],
+      "radius": 0.035,
+      "rotation_axis": "all"
+    }
+  ],
+  "colliders": [
+    {"name": "Head", "bone": "Head", "shape": "sphere", "radius": 0.1, "height": 0.0, "position_offset": [0.0, 0.0, 0.0]},
+    {"name": "Hips", "bone": "Hips", "shape": "capsule", "radius": 0.12, "height": 0.3, "position_offset": [0.0, 0.0, 0.0]}
+  ]
+}

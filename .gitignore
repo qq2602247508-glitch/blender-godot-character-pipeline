@@ -1,0 +1,17 @@
+# Blender
+*.blend1
+__pycache__/
+*.pyc
+
+# Godot
+.godot/
+
+# Generated assets and local tests
+*.glb
+*.gltf
+*.fbx
+*.zip
+tests/output/
+
+# macOS
+.DS_Store
