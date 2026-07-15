@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Game Secondary Motion Builder",
     "author": "inagi + Codex",
-    "version": (1, 6, 2),
+    "version": (1, 7, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Secondary Motion",
     "description": "Build and analyze lightweight hair/skirt secondary-motion test assets",
@@ -21,6 +21,7 @@ from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
 from . import production
+from . import hero_rig
 
 
 GENERATED_COLLECTION = "GSMB_GENERATED"
@@ -2509,9 +2510,11 @@ def register():
         default="EXACT",
     )
     production.register()
+    hero_rig.register()
 
 
 def unregister():
+    hero_rig.unregister()
     production.unregister()
     for name in ("gsmb_stiffness", "gsmb_damping", "gsmb_inertia", "gsmb_gravity", "gsmb_angle_limit", "gsmb_collision_radius", "gsmb_cut_through", "gsmb_optimize_target_tris", "gsmb_retopo_target_faces", "gsmb_optimize_hide_source", "gsmb_ribbon_depth", "gsmb_ribbon_width", "gsmb_show_cut_advanced", "gsmb_cut_mode", "gsmb_cut_method"):
         if hasattr(bpy.types.Scene, name):
