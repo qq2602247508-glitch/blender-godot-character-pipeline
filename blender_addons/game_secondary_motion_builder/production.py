@@ -196,29 +196,168 @@ def _weight_hair(mesh, armature, chains, parent_bone):
         _add_normalized_weights(mesh, vertex.index, weights)
 
 
-def _weight_hair_from_guides(mesh, armature, chains, parent_bone):
+def _base_object_name(name):
+    """Return a stable source name for Blender copies used in preview rigs."""
+    value = re.sub(r"\.\d{3}$", "", name or "")
+    for prefix in ("GSMB_TEST_", "GSMB_PREVIEW_", "GSMB_COPY_"):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+            break
+    return value
+
+
+def _guide_matches_mesh(mesh, source_name):
+    if not source_name:
+        return False
+    explicit = mesh.get("gsmb_source_mesh") or mesh.get("gsmb_original_mesh")
+    candidates = {
+        _base_object_name(mesh.name),
+        _base_object_name(mesh.data.name),
+        _base_object_name(explicit),
+    }
+    return _base_object_name(source_name) in candidates
+
+
+def _chain_points(armature, chain):
+    bones = [armature.data.bones[name] for name in chain]
+    return [bone.head_local.copy() for bone in bones] + [bones[-1].tail_local.copy()]
+
+
+def _point_to_polyline(point, polyline):
+    best = None
+    segment_count = len(polyline) - 1
+    for segment_index in range(segment_count):
+        first, second = polyline[segment_index], polyline[segment_index + 1]
+        direction = second - first
+        length_squared = max(1e-12, direction.length_squared)
+        factor = max(0.0, min(1.0, (point - first).dot(direction) / length_squared))
+        projected = first + direction * factor
+        candidate = ((point - projected).length_squared, (segment_index + factor) / segment_count)
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+    return best
+
+
+def _surface_chain_weights(mesh, points, chain_points):
+    """Assign each connected hair card to one guide without hidden rig seams.
+
+    AI hair meshes often fuse visually separate locks into one topological shell.
+    Splitting such a shell between chains creates stretched triangles at the
+    invisible boundary. Multiple chains are therefore automatic only across real
+    disconnected components; continuous shells require an explicit region mask.
+    """
+    vertex_count = len(points)
+    adjacency = [[] for _ in range(vertex_count)]
+    for edge in mesh.data.edges:
+        first, second = edge.vertices
+        distance = max(1e-8, (points[first] - points[second]).length)
+        adjacency[first].append((second, distance))
+        adjacency[second].append((first, distance))
+
+    component_ids = [-1] * vertex_count
+    components = []
+    for start in range(vertex_count):
+        if component_ids[start] >= 0:
+            continue
+        component_index = len(components)
+        component = []
+        stack = [start]
+        component_ids[start] = component_index
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbor, _ in adjacency[current]:
+                if component_ids[neighbor] < 0:
+                    component_ids[neighbor] = component_index
+                    stack.append(neighbor)
+        components.append(component)
+
+    result = [None] * vertex_count
+    progress = [0.0] * vertex_count
+    for component in components:
+        # A bounded sample is enough to choose the guide while keeping 100k+
+        # vertex AI meshes interactive.
+        stride = max(1, len(component) // 2048)
+        sample = component[::stride]
+        scores = []
+        for chain_index, polyline in enumerate(chain_points):
+            score = sum(_point_to_polyline(points[index], polyline)[0] for index in sample)
+            scores.append((score / len(sample), chain_index))
+        owner = min(scores)[1]
+        root = min(component, key=lambda index: (points[index] - chain_points[owner][0]).length_squared)
+        tip = min(component, key=lambda index: (points[index] - chain_points[owner][-1]).length_squared)
+        distances = {root: 0.0}
+        queue = [(0.0, root)]
+        while queue:
+            distance, vertex_index = heapq.heappop(queue)
+            if distance > distances.get(vertex_index, float("inf")) + 1e-10:
+                continue
+            for neighbor, edge_length in adjacency[vertex_index]:
+                if component_ids[neighbor] != component_ids[vertex_index]:
+                    continue
+                candidate = distance + edge_length
+                if candidate + 1e-10 < distances.get(neighbor, float("inf")):
+                    distances[neighbor] = candidate
+                    heapq.heappush(queue, (candidate, neighbor))
+        span = distances.get(tip, 0.0)
+        if span <= 1e-6:
+            tip = min(component, key=lambda index: points[index].z)
+            span = max(1e-6, distances.get(tip, 0.0))
+        for vertex_index in component:
+            result[vertex_index] = ((owner, 1.0),)
+            progress[vertex_index] = max(0.0, min(1.0, distances[vertex_index] / span))
+    return result, progress
+
+
+def _weight_hair_from_guides(mesh, armature, chains, parent_bone, chain_sources=None):
+    if chain_sources is None:
+        eligible = list(range(len(chains)))
+    else:
+        eligible = [
+            index for index, source_name in enumerate(chain_sources)
+            if _guide_matches_mesh(mesh, source_name)
+        ]
+    if not eligible:
+        raise ValueError(f"No hair guide belongs to selected mesh {mesh.name}")
+
+    eligible_chains = [chains[index] for index in eligible]
     chain_points = []
-    for chain in chains:
-        bones = [armature.data.bones[name] for name in chain]
-        chain_points.append([bone.head_local.copy() for bone in bones] + [bones[-1].tail_local.copy()])
-    for vertex, point in zip(mesh.data.vertices, _mesh_points_in_armature(mesh, armature)):
-        best = None
-        for chain_index, points in enumerate(chain_points):
-            segment_count = len(points) - 1
-            for segment_index in range(segment_count):
-                first, second = points[segment_index], points[segment_index + 1]
-                direction = second - first
-                length_squared = max(1e-12, direction.length_squared)
-                factor = max(0.0, min(1.0, (point - first).dot(direction) / length_squared))
-                projected = first + direction * factor
-                candidate = ((point - projected).length_squared, chain_index, (segment_index + factor) / segment_count)
-                if best is None or candidate[0] < best[0]:
-                    best = candidate
-        _, chain_index, progress = best
-        root_weight = max(0.0, 1.0 - progress / 0.18)
+    for chain in eligible_chains:
+        chain_points.append(_chain_points(armature, chain))
+    mesh_points = _mesh_points_in_armature(mesh, armature)
+    minimum, maximum = _bounds(mesh_points)
+    height = max(1e-6, maximum.z - minimum.z)
+    surface_weights, surface_progress = _surface_chain_weights(mesh, mesh_points, chain_points)
+    for vertex, point, chain_weights, progress in zip(
+        mesh.data.vertices, mesh_points, surface_weights, surface_progress
+    ):
+        progress_by_chain = [
+            (chain_index, chain_weight, progress)
+            for chain_index, chain_weight in chain_weights
+            if chain_weight > 1e-6
+        ]
+        vertical_down = max(0.0, min(1.0, (maximum.z - point.z) / height))
+        scalp_pin = (
+            max(0.0, 1.0 - vertical_down / 0.28)
+            if len(eligible_chains) > 1 else 0.0
+        )
+        guide_root_pin = max(0.0, 1.0 - progress / 0.35)
+        root_weight = max(scalp_pin, guide_root_pin)
         weights = [(parent_bone, root_weight)]
-        for bone_index, bone_weight in _linear_pair(progress, len(chains[chain_index])):
-            weights.append((chains[chain_index][bone_index], (1.0 - root_weight) * bone_weight))
+        for chain_index, chain_weight, chain_progress in progress_by_chain:
+            if root_weight > 0.0:
+                weights.append((
+                    eligible_chains[chain_index][0],
+                    (1.0 - root_weight) * chain_weight,
+                ))
+            else:
+                for bone_index, bone_weight in _linear_pair(
+                    chain_progress, len(eligible_chains[chain_index])
+                ):
+                    weights.append((
+                        eligible_chains[chain_index][bone_index],
+                        chain_weight * bone_weight,
+                    ))
         _add_normalized_weights(mesh, vertex.index, weights)
 
 
@@ -265,7 +404,9 @@ def _make_hair_chains(armature, meshes, asset_id, parent_bone, chain_count, bone
     return chains
 
 
-def _make_hair_chains_from_guides(scene, armature, asset_id, parent_bone, bones_per_chain, settings):
+def _make_hair_chains_from_guides(
+    scene, armature, meshes, asset_id, parent_bone, bones_per_chain, settings
+):
     collection = bpy.data.collections.get(HAIR_GUIDE_COLLECTION)
     guides = [] if collection is None else sorted(
         (obj for obj in collection.objects if obj.type == "CURVE" and obj.get("gsmb_hair_guide")),
@@ -275,16 +416,26 @@ def _make_hair_chains_from_guides(scene, armature, asset_id, parent_bone, bones_
         raise ValueError("No semi-auto hair guides found; capture a root and tip first")
     to_armature = armature.matrix_world.inverted()
     chains = []
+    chain_sources = []
     for guide_index, guide in enumerate(guides, 1):
         if not guide.data.splines or not guide.data.splines[0].points:
             continue
         world_points = [guide.matrix_world @ Vector(point.co[:3]) for point in guide.data.splines[0].points]
+        source_name = guide.get("gsmb_source_mesh", "")
+        target_mesh = next(
+            (mesh for mesh in meshes if _guide_matches_mesh(mesh, source_name)), None
+        )
+        source_mesh = bpy.data.objects.get(source_name)
+        if target_mesh is not None and source_mesh is not None and target_mesh != source_mesh:
+            source_to_target = target_mesh.matrix_world @ source_mesh.matrix_world.inverted_safe()
+            world_points = [source_to_target @ point for point in world_points]
         local_points = [to_armature @ point for point in _resample_polyline(world_points, bones_per_chain + 1)]
         prefix = f"GSMB_{asset_id}_Hair_{guide_index:02d}"
         chains.append(_add_chain(armature, prefix, local_points, parent_bone, settings))
+        chain_sources.append(source_name)
     if not chains:
         raise ValueError("Hair guide collection contains no usable poly guides")
-    return chains
+    return chains, chain_sources
 
 
 def _make_skirt_chains(armature, meshes, asset_id, parent_bone, chain_count, bones_per_chain, settings):
@@ -612,8 +763,8 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
         try:
             if equipment_type == "HAIR":
                 if scene.gsmb_hair_build_mode == "GUIDES":
-                    chains = _make_hair_chains_from_guides(
-                        scene, armature, asset_id, parent_bone,
+                    chains, chain_sources = _make_hair_chains_from_guides(
+                        scene, armature, meshes, asset_id, parent_bone,
                         scene.gsmb_prod_bones_per_chain, settings,
                     )
                 else:
@@ -621,6 +772,7 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
                         armature, meshes, asset_id, parent_bone,
                         scene.gsmb_prod_chain_count, scene.gsmb_prod_bones_per_chain, settings,
                     )
+                    chain_sources = None
                 center = None
             else:
                 chains, center = _make_skirt_chains(
@@ -634,8 +786,20 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
             return {"CANCELLED"}
         bpy.ops.object.mode_set(mode="OBJECT")
 
+        if equipment_type == "HAIR" and chain_sources is not None:
+            unmatched = [
+                mesh.name for mesh in meshes
+                if not any(_guide_matches_mesh(mesh, source) for source in chain_sources)
+            ]
+            if unmatched:
+                bpy.data.objects.remove(armature, do_unlink=True)
+                self.report({"ERROR"}, "No owned hair guide for: " + ", ".join(unmatched))
+                return {"CANCELLED"}
+
         armature["gsmb_bone_mapping"] = json.dumps(mapping, ensure_ascii=False)
         armature["gsmb_chain_manifest"] = json.dumps(chains, ensure_ascii=False)
+        if equipment_type == "HAIR" and chain_sources is not None:
+            armature["gsmb_guide_sources"] = json.dumps(chain_sources, ensure_ascii=False)
         for mesh in meshes:
             _clear_deform_groups(mesh, armature)
             _ensure_modifier(mesh, armature)
@@ -644,7 +808,13 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
             mesh["gsmb_equipment_rig"] = armature.name
             if equipment_type == "HAIR":
                 if scene.gsmb_hair_build_mode == "GUIDES":
-                    _weight_hair_from_guides(mesh, armature, chains, parent_bone)
+                    _weight_hair_from_guides(
+                        mesh, armature, chains, parent_bone, chain_sources
+                    )
+                    mesh["gsmb_source_mesh"] = next(
+                        source_name for source_name in chain_sources
+                        if _guide_matches_mesh(mesh, source_name)
+                    )
                 else:
                     _weight_hair(mesh, armature, chains, parent_bone)
             else:
