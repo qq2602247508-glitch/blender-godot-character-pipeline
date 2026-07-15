@@ -7,15 +7,18 @@ profile consumed by the Godot side of the pipeline.
 """
 
 import json
+import heapq
 import math
 import os
 import re
 
 import bpy
+import bmesh
 from mathutils import Matrix, Vector
 
 
 PRODUCTION_COLLECTION = "GSMB_PRODUCTION"
+HAIR_GUIDE_COLLECTION = "GSMB_HAIR_GUIDES"
 
 
 BONE_ALIASES = {
@@ -193,6 +196,32 @@ def _weight_hair(mesh, armature, chains, parent_bone):
         _add_normalized_weights(mesh, vertex.index, weights)
 
 
+def _weight_hair_from_guides(mesh, armature, chains, parent_bone):
+    chain_points = []
+    for chain in chains:
+        bones = [armature.data.bones[name] for name in chain]
+        chain_points.append([bone.head_local.copy() for bone in bones] + [bones[-1].tail_local.copy()])
+    for vertex, point in zip(mesh.data.vertices, _mesh_points_in_armature(mesh, armature)):
+        best = None
+        for chain_index, points in enumerate(chain_points):
+            segment_count = len(points) - 1
+            for segment_index in range(segment_count):
+                first, second = points[segment_index], points[segment_index + 1]
+                direction = second - first
+                length_squared = max(1e-12, direction.length_squared)
+                factor = max(0.0, min(1.0, (point - first).dot(direction) / length_squared))
+                projected = first + direction * factor
+                candidate = ((point - projected).length_squared, chain_index, (segment_index + factor) / segment_count)
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+        _, chain_index, progress = best
+        root_weight = max(0.0, 1.0 - progress / 0.18)
+        weights = [(parent_bone, root_weight)]
+        for bone_index, bone_weight in _linear_pair(progress, len(chains[chain_index])):
+            weights.append((chains[chain_index][bone_index], (1.0 - root_weight) * bone_weight))
+        _add_normalized_weights(mesh, vertex.index, weights)
+
+
 def _weight_skirt(mesh, armature, chains, parent_bone, center):
     points = _mesh_points_in_armature(mesh, armature)
     minimum, maximum = _bounds(points)
@@ -233,6 +262,28 @@ def _make_hair_chains(armature, meshes, asset_id, parent_bone, chain_count, bone
         ]
         prefix = f"GSMB_{asset_id}_Hair_{chain_index + 1:02d}"
         chains.append(_add_chain(armature, prefix, points, parent_bone, settings))
+    return chains
+
+
+def _make_hair_chains_from_guides(scene, armature, asset_id, parent_bone, bones_per_chain, settings):
+    collection = bpy.data.collections.get(HAIR_GUIDE_COLLECTION)
+    guides = [] if collection is None else sorted(
+        (obj for obj in collection.objects if obj.type == "CURVE" and obj.get("gsmb_hair_guide")),
+        key=lambda obj: obj.name,
+    )
+    if not guides:
+        raise ValueError("No semi-auto hair guides found; capture a root and tip first")
+    to_armature = armature.matrix_world.inverted()
+    chains = []
+    for guide_index, guide in enumerate(guides, 1):
+        if not guide.data.splines or not guide.data.splines[0].points:
+            continue
+        world_points = [guide.matrix_world @ Vector(point.co[:3]) for point in guide.data.splines[0].points]
+        local_points = [to_armature @ point for point in _resample_polyline(world_points, bones_per_chain + 1)]
+        prefix = f"GSMB_{asset_id}_Hair_{guide_index:02d}"
+        chains.append(_add_chain(armature, prefix, local_points, parent_bone, settings))
+    if not chains:
+        raise ValueError("Hair guide collection contains no usable poly guides")
     return chains
 
 
@@ -354,6 +405,161 @@ def _settings(scene):
     }
 
 
+def _hair_guide_collection(scene):
+    collection = bpy.data.collections.get(HAIR_GUIDE_COLLECTION)
+    if collection is None:
+        collection = bpy.data.collections.new(HAIR_GUIDE_COLLECTION)
+    if collection.name not in {child.name for child in scene.collection.children}:
+        scene.collection.children.link(collection)
+    return collection
+
+
+def _selected_edit_vertex_index(obj):
+    if obj is None or obj.type != "MESH" or obj.mode != "EDIT":
+        return -1
+    mesh = bmesh.from_edit_mesh(obj.data)
+    mesh.verts.ensure_lookup_table()
+    selected = [vertex for vertex in mesh.verts if vertex.select]
+    if not selected:
+        return -1
+    center = sum((vertex.co for vertex in selected), Vector()) / len(selected)
+    return min(selected, key=lambda vertex: (vertex.co - center).length_squared).index
+
+
+def _surface_path(obj, start_index, end_index):
+    obj.update_from_editmode()
+    vertices = obj.data.vertices
+    adjacency = [[] for _ in vertices]
+    world_points = [obj.matrix_world @ vertex.co for vertex in vertices]
+    for edge in obj.data.edges:
+        first, second = edge.vertices
+        distance = (world_points[first] - world_points[second]).length
+        adjacency[first].append((second, distance))
+        adjacency[second].append((first, distance))
+    queue = [(0.0, start_index)]
+    costs = {start_index: 0.0}
+    previous = {}
+    target = world_points[end_index]
+    while queue:
+        _, current = heapq.heappop(queue)
+        if current == end_index:
+            break
+        current_cost = costs[current]
+        for neighbor, distance in adjacency[current]:
+            new_cost = current_cost + distance
+            if new_cost >= costs.get(neighbor, float("inf")):
+                continue
+            costs[neighbor] = new_cost
+            previous[neighbor] = current
+            heuristic = (world_points[neighbor] - target).length
+            heapq.heappush(queue, (new_cost + heuristic, neighbor))
+    if end_index not in costs:
+        return []
+    indices = [end_index]
+    while indices[-1] != start_index:
+        indices.append(previous[indices[-1]])
+    indices.reverse()
+    return [world_points[index] for index in indices]
+
+
+def _resample_polyline(points, count):
+    if len(points) < 2:
+        return points
+    cumulative = [0.0]
+    for first, second in zip(points, points[1:]):
+        cumulative.append(cumulative[-1] + (second - first).length)
+    total = cumulative[-1]
+    if total <= 1e-8:
+        return [points[0].copy() for _ in range(count)]
+    result = []
+    segment = 0
+    for index in range(count):
+        target = total * index / (count - 1)
+        while segment < len(cumulative) - 2 and cumulative[segment + 1] < target:
+            segment += 1
+        span = max(1e-8, cumulative[segment + 1] - cumulative[segment])
+        factor = (target - cumulative[segment]) / span
+        result.append(points[segment].lerp(points[segment + 1], factor))
+    for _ in range(2):
+        result = [result[0]] + [
+            (result[index - 1] + result[index] * 2.0 + result[index + 1]) / 4.0
+            for index in range(1, len(result) - 1)
+        ] + [result[-1]]
+    return result
+
+
+def _create_hair_guide(scene, source, root_index, tip_index, points):
+    collection = _hair_guide_collection(scene)
+    guide_number = 1 + sum(1 for obj in collection.objects if obj.get("gsmb_hair_guide"))
+    name = f"GSMB_GUIDE_{_safe_id(source.name)}_{guide_number:02d}"
+    data = bpy.data.curves.new(name, "CURVE")
+    data.dimensions = "3D"
+    data.bevel_depth = max(0.0005, scene.gsmb_hair_guide_display_size)
+    data.bevel_resolution = 2
+    spline = data.splines.new("POLY")
+    spline.points.add(len(points) - 1)
+    for point, coordinate in zip(spline.points, points):
+        point.co = (*coordinate, 1.0)
+    guide = bpy.data.objects.new(name, data)
+    collection.objects.link(guide)
+    material = bpy.data.materials.get("GSMB_HairGuide") or bpy.data.materials.new("GSMB_HairGuide")
+    material.diffuse_color = (0.05, 1.0, 0.18, 1.0)
+    data.materials.append(material)
+    guide.show_in_front = True
+    guide["gsmb_hair_guide"] = True
+    guide["gsmb_source_mesh"] = source.name
+    guide["gsmb_root_vertex"] = root_index
+    guide["gsmb_tip_vertex"] = tip_index
+    return guide
+
+
+class GSMB_OT_capture_hair_root(bpy.types.Operator):
+    bl_idname = "gsmb.capture_hair_root"
+    bl_label = "Capture Selected Root"
+    bl_description = "In Edit Mode, store the center vertex of the selected hair-root region"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = context.active_object
+        index = _selected_edit_vertex_index(obj)
+        if index < 0:
+            self.report({"ERROR"}, "Edit a hair mesh and select one or more root vertices")
+            return {"CANCELLED"}
+        context.scene.gsmb_hair_root_object = obj
+        context.scene.gsmb_hair_root_vertex = index
+        context.scene["gsmb_prod_status"] = f"Hair root captured: {obj.name} vertex {index}"
+        self.report({"INFO"}, context.scene["gsmb_prod_status"])
+        return {"FINISHED"}
+
+
+class GSMB_OT_create_hair_guide(bpy.types.Operator):
+    bl_idname = "gsmb.create_hair_guide"
+    bl_label = "Create Guide to Selected Tip"
+    bl_description = "Trace a smooth editable guide from the stored root to the selected hair tip"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        obj = context.active_object
+        if obj is None or obj != scene.gsmb_hair_root_object or obj.mode != "EDIT":
+            self.report({"ERROR"}, "Keep editing the same mesh used to capture the root")
+            return {"CANCELLED"}
+        tip_index = _selected_edit_vertex_index(obj)
+        root_index = scene.gsmb_hair_root_vertex
+        if tip_index < 0 or root_index < 0 or tip_index == root_index:
+            self.report({"ERROR"}, "Select a different vertex or face at the hair tip")
+            return {"CANCELLED"}
+        path = _surface_path(obj, root_index, tip_index)
+        if not path:
+            self.report({"ERROR"}, "Root and tip are on disconnected mesh islands")
+            return {"CANCELLED"}
+        points = _resample_polyline(path, scene.gsmb_hair_guide_points)
+        guide = _create_hair_guide(scene, obj, root_index, tip_index, points)
+        scene["gsmb_prod_status"] = f"Created editable guide {guide.name} with {len(points)} points"
+        self.report({"INFO"}, scene["gsmb_prod_status"])
+        return {"FINISHED"}
+
+
 class GSMB_OT_generate_production_equipment(bpy.types.Operator):
     bl_idname = "gsmb.generate_production_equipment"
     bl_label = "Build Dynamic Equipment Rig"
@@ -405,10 +611,16 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
         settings = _settings(scene)
         try:
             if equipment_type == "HAIR":
-                chains = _make_hair_chains(
-                    armature, meshes, asset_id, parent_bone,
-                    scene.gsmb_prod_chain_count, scene.gsmb_prod_bones_per_chain, settings,
-                )
+                if scene.gsmb_hair_build_mode == "GUIDES":
+                    chains = _make_hair_chains_from_guides(
+                        scene, armature, asset_id, parent_bone,
+                        scene.gsmb_prod_bones_per_chain, settings,
+                    )
+                else:
+                    chains = _make_hair_chains(
+                        armature, meshes, asset_id, parent_bone,
+                        scene.gsmb_prod_chain_count, scene.gsmb_prod_bones_per_chain, settings,
+                    )
                 center = None
             else:
                 chains, center = _make_skirt_chains(
@@ -431,7 +643,10 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
             mesh["gsmb_dynamic_equipment"] = True
             mesh["gsmb_equipment_rig"] = armature.name
             if equipment_type == "HAIR":
-                _weight_hair(mesh, armature, chains, parent_bone)
+                if scene.gsmb_hair_build_mode == "GUIDES":
+                    _weight_hair_from_guides(mesh, armature, chains, parent_bone)
+                else:
+                    _weight_hair(mesh, armature, chains, parent_bone)
             else:
                 _weight_skirt(mesh, armature, chains, parent_bone, center)
 
@@ -674,6 +889,21 @@ class GSMB_PT_production(bpy.types.Panel):
         layout.prop(scene, "gsmb_prod_asset_id")
         layout.prop(scene, "gsmb_prod_skeleton_version")
         layout.prop(scene, "gsmb_prod_equipment_type", expand=True)
+        if scene.gsmb_prod_equipment_type == "HAIR":
+            guides = layout.box()
+            guides.label(text="Hair guides (works before rigging)", icon="CURVE_DATA")
+            guides.prop(scene, "gsmb_hair_build_mode", expand=True)
+            if scene.gsmb_hair_build_mode == "GUIDES":
+                guides.label(text="Edit mesh: select root, capture, then select tip")
+                guides.prop(scene, "gsmb_hair_guide_points")
+                guides.prop(scene, "gsmb_hair_guide_display_size")
+                row = guides.row(align=True)
+                row.operator("gsmb.capture_hair_root", icon="PINNED")
+                row.operator("gsmb.create_hair_guide", icon="CURVE_PATH")
+                if scene.gsmb_hair_root_object:
+                    guides.label(
+                        text=f"Root: {scene.gsmb_hair_root_object.name} / vertex {scene.gsmb_hair_root_vertex}"
+                    )
         row = layout.row(align=True)
         row.prop(scene, "gsmb_prod_chain_count")
         row.prop(scene, "gsmb_prod_bones_per_chain")
@@ -708,6 +938,8 @@ class GSMB_PT_production(bpy.types.Panel):
 
 
 classes = (
+    GSMB_OT_capture_hair_root,
+    GSMB_OT_create_hair_guide,
     GSMB_OT_generate_production_equipment,
     GSMB_OT_export_godot_profile,
     GSMB_OT_export_dynamic_equipment_package,
@@ -718,6 +950,10 @@ classes = (
 
 def _armature_poll(_self, obj):
     return obj is None or obj.type == "ARMATURE"
+
+
+def _mesh_poll(_self, obj):
+    return obj is None or obj.type == "MESH"
 
 
 def register():
@@ -735,6 +971,26 @@ def register():
         name="Type",
         items=(("HAIR", "Hair", "Long hair or braid chains"), ("SKIRT", "Skirt/Cape", "Radial skirt, coat or cape chains")),
         default="SKIRT",
+    )
+    bpy.types.Scene.gsmb_hair_build_mode = bpy.props.EnumProperty(
+        name="Hair Build",
+        items=(
+            ("AUTO", "Automatic", "Distribute simple vertical chains from the hair bounds"),
+            ("GUIDES", "From Guides", "Build and weight chains from manually captured surface guides"),
+        ),
+        default="AUTO",
+    )
+    bpy.types.Scene.gsmb_hair_root_object = bpy.props.PointerProperty(
+        name="Guide Source", type=bpy.types.Object, poll=_mesh_poll,
+    )
+    bpy.types.Scene.gsmb_hair_root_vertex = bpy.props.IntProperty(
+        name="Root Vertex", default=-1, min=-1,
+    )
+    bpy.types.Scene.gsmb_hair_guide_points = bpy.props.IntProperty(
+        name="Guide Points", default=7, min=3, max=24,
+    )
+    bpy.types.Scene.gsmb_hair_guide_display_size = bpy.props.FloatProperty(
+        name="Guide Thickness", default=0.003, min=0.0001, max=0.05, subtype="DISTANCE",
     )
     bpy.types.Scene.gsmb_prod_chain_count = bpy.props.IntProperty(name="Chains", default=8, min=1, max=32)
     bpy.types.Scene.gsmb_prod_bones_per_chain = bpy.props.IntProperty(name="Bones", default=3, min=1, max=8)
@@ -759,6 +1015,8 @@ def unregister():
     names = (
         "gsmb_prod_armature", "gsmb_prod_equipment_armature", "gsmb_prod_asset_id",
         "gsmb_prod_skeleton_version", "gsmb_prod_equipment_type", "gsmb_prod_chain_count",
+        "gsmb_hair_build_mode", "gsmb_hair_root_object", "gsmb_hair_root_vertex",
+        "gsmb_hair_guide_points", "gsmb_hair_guide_display_size",
         "gsmb_prod_bones_per_chain", "gsmb_prod_stiffness", "gsmb_prod_drag",
         "gsmb_prod_gravity", "gsmb_prod_radius", "gsmb_prod_head_bone",
         "gsmb_prod_chest_bone", "gsmb_prod_hips_bone", "gsmb_prod_thigh_l_bone",

@@ -71,6 +71,10 @@ visibility.
   --background --factory-startup \
   --python tests/blender_smoke.py
 
+/Applications/Blender.app/Contents/MacOS/Blender \
+  --background --factory-startup \
+  --python tests/blender_hair_guides_smoke.py
+
 GSMB_REAL_MODEL=/path/to/Witch.gltf \
 /Applications/Blender.app/Contents/MacOS/Blender \
   --background --factory-startup \
@@ -82,3 +86,17 @@ The optional real-model regression uses Quaternius'
 `Witch.gltf`. It non-destructively extracts a skirt test mesh from the modular
 body and exercises the complete package export without committing third-party
 asset files to this repository.
+
+## Semi-automatic complex hair
+
+Complex curls and layered AI hair can use editable surface guides before the
+character has an armature. In Hair / From Guides mode:
+
+1. Edit a hair part and select a small root region.
+2. Click **Capture Selected Root**.
+3. Select the matching tip region and click **Create Guide to Selected Tip**.
+4. Edit the generated curve if needed and repeat for each major lock.
+5. After the humanoid rig exists, build the hair equipment from those guides.
+
+Simple ponytails can still use automatic distribution. Guide-driven weighting
+assigns each vertex to the closest chain and keeps the four-influence limit.

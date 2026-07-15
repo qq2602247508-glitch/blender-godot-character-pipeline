@@ -22,6 +22,12 @@ Shirts, trousers, gloves, shoes, and short rigid hairstyles bind directly to the
 
 Long hair, skirts, coats, capes, braids, and tails contain an equipment-local skeleton. The local skeleton includes copied humanoid anchor bones plus equipment-specific `GSMB_*` chains.
 
+Complex layered hair may be authored before the humanoid rig exists. Each
+`GSMB_HAIR_GUIDES` curve records a source mesh, root vertex, tip vertex, and an
+editable surface path. After rigging, Hair / From Guides converts those curves
+to equipment bones and weights every vertex to its closest guide chain. Simple
+ponytails may continue to use automatic distribution.
+
 Required Godot hierarchy:
 
 ```text
