@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Game Secondary Motion Builder",
     "author": "inagi + Codex",
-    "version": (1, 7, 2),
+    "version": (1, 7, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Secondary Motion",
     "description": "Build and analyze lightweight hair/skirt secondary-motion test assets",

@@ -120,7 +120,33 @@ def main():
     bpy.context.view_layer.update()
     after = hips_collider.matrix_world.translation.copy()
     assert abs((after - before).x - 0.2) < 1e-5
-    print("GSMB_BLENDER_SMOKE_OK chains=8 bones=24 colliders=5 max_influences=4")
+
+    # Regression: a Kimodo-style source Action must not leave the independent
+    # skirt rig static. The bake must also keep canonical anchors attached.
+    equipment.pose.bones["Hips"].location.x = 0.0
+    source.animation_data_create()
+    action = bpy.data.actions.new("KIMODO_Smoke_Idle_Loop")
+    source.animation_data.action = action
+    for frame, angle in ((1, 0.0), (30, math.radians(5.0)), (60, 0.0)):
+        source.pose.bones["mixamorig:Hips"].rotation_mode = "XYZ"
+        source.pose.bones["mixamorig:Hips"].rotation_euler.z = angle
+        source.pose.bones["mixamorig:Hips"].keyframe_insert("rotation_euler", frame=frame)
+        source.pose.bones["mixamorig:Head"].rotation_mode = "XYZ"
+        source.pose.bones["mixamorig:Head"].rotation_euler.x = -angle * 0.5
+        source.pose.bones["mixamorig:Head"].keyframe_insert("rotation_euler", frame=frame)
+    assert bpy.ops.gsmb.bake_action_secondary() == {"FINISHED"}
+    secondary = equipment.animation_data.action
+    assert secondary.get("gsmb_generated_secondary")
+    assert secondary.get("gsmb_source_action") == action.name
+    assert secondary.get("gsmb_dynamic_max_angle_deg") > 0.1
+    assert secondary.get("gsmb_anchor_max_error_m") < 1e-3
+    dynamic_curves = [
+        curve for curve in secondary.fcurves
+        if "GSMB_" in curve.data_path and curve.data_path.endswith("rotation_euler")
+    ]
+    assert dynamic_curves
+    assert any(abs(curve.evaluate(30) - curve.evaluate(1)) > 1e-4 for curve in dynamic_curves)
+    print("GSMB_BLENDER_SMOKE_OK chains=8 bones=24 colliders=5 kimodo_secondary=1")
 
 
 if __name__ == "__main__":

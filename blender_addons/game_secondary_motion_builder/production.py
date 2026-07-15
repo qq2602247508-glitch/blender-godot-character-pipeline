@@ -19,6 +19,7 @@ from mathutils import Matrix, Vector
 
 PRODUCTION_COLLECTION = "GSMB_PRODUCTION"
 HAIR_GUIDE_COLLECTION = "GSMB_HAIR_GUIDES"
+_KIMODO_SECONDARY_BUSY = False
 
 
 BONE_ALIASES = {
@@ -80,6 +81,248 @@ def _resolve_bone(armature, role, explicit=""):
         if match:
             return match
     return ""
+
+
+def _json_property(obj, name, fallback):
+    try:
+        return json.loads(obj.get(name, ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return fallback
+
+
+def _equipment_for_source(source):
+    return [
+        obj for obj in bpy.data.objects
+        if obj.type == "ARMATURE"
+        and obj.get("gsmb_production_equipment")
+        and obj.get("gsmb_source_armature") == source.name
+        and _json_property(obj, "gsmb_chain_manifest", [])
+    ]
+
+
+def _equipment_bone_map(source, equipment):
+    """Map equipment-local humanoid anchors back to the source rig."""
+    result = {
+        bone.name: bone.name
+        for bone in equipment.data.bones
+        if bone.name in source.data.bones and not bone.get("gsmb_secondary")
+    }
+    source_roles = _json_property(equipment, "gsmb_bone_mapping", {})
+    target_roles = _json_property(equipment, "gsmb_canonical_mapping", {})
+    for role, target_name in target_roles.items():
+        source_name = source_roles.get(role)
+        if target_name in equipment.data.bones and source_name in source.data.bones:
+            result[target_name] = source_name
+    return result
+
+
+def _new_secondary_action(equipment, source_action):
+    equipment.animation_data_create()
+    old = equipment.animation_data.action
+    if old and old.get("gsmb_generated_secondary"):
+        bpy.data.actions.remove(old)
+    equipment_type = equipment.get("gsmb_equipment_type", "EQUIPMENT").title()
+    name = f"{source_action.name}__{equipment_type}_Secondary"
+    existing = bpy.data.actions.get(name)
+    if existing:
+        bpy.data.actions.remove(existing)
+    action = bpy.data.actions.new(name)
+    action.use_fake_user = True
+    action["gsmb_generated_secondary"] = True
+    action["gsmb_source_action"] = source_action.name
+    equipment.animation_data.action = action
+    return action
+
+
+def bake_secondary_actions(context, source, *, hair_strength=1.0, skirt_strength=1.0):
+    """Bake source anchors and a lightweight loop-safe secondary preview.
+
+    Godot still owns runtime SpringBone simulation.  This bake exists so a
+    freshly retargeted Kimodo clip cannot leave Blender equipment frozen.
+    """
+    if source is None or source.type != "ARMATURE":
+        raise ValueError("Source must be an armature")
+    source_action = source.animation_data.action if source.animation_data else None
+    if source_action is None:
+        raise ValueError("Source armature has no active Action")
+    equipment_items = _equipment_for_source(source)
+    if not equipment_items:
+        raise ValueError(f"No dynamic equipment references {source.name}")
+
+    scene = context.scene
+    start = int(math.floor(source_action.frame_range[0]))
+    end = int(math.ceil(source_action.frame_range[1]))
+    frames = list(range(start, end + 1))
+    if len(frames) < 2:
+        raise ValueError("Source Action needs at least two frames")
+
+    source_samples = {}
+    for frame in frames:
+        scene.frame_set(frame)
+        source_samples[frame] = {
+            bone.name: bone.matrix.copy() for bone in source.pose.bones
+        }
+
+    first = source_samples[frames[0]]
+    last = source_samples[frames[-1]]
+    looped = True
+    for name in first.keys() & last.keys():
+        if (first[name].translation - last[name].translation).length > 1e-4:
+            looped = False
+            break
+        if first[name].to_quaternion().rotation_difference(last[name].to_quaternion()).angle > math.radians(0.1):
+            looped = False
+            break
+
+    results = []
+    period = max(1, len(frames) - 1 if looped else len(frames))
+    for equipment in equipment_items:
+        action = _new_secondary_action(equipment, source_action)
+        bone_map = _equipment_bone_map(source, equipment)
+        chains = _json_property(equipment, "gsmb_chain_manifest", [])
+        source_roles = _json_property(equipment, "gsmb_bone_mapping", {})
+        equipment_type = equipment.get("gsmb_equipment_type", "SKIRT")
+
+        def delayed_delta(source_name, index, delay):
+            if source_name not in source.data.bones:
+                return Vector((0.0, 0.0, 0.0))
+            delayed_index = (index - delay) % period if looped else max(0, index - delay)
+            current = source_samples[frames[index]][source_name].to_quaternion()
+            delayed = source_samples[frames[delayed_index]][source_name].to_quaternion()
+            return Vector(current.rotation_difference(delayed).to_euler("XYZ"))
+
+        for index, frame in enumerate(frames):
+            scene.frame_set(frame)
+            matrices = source_samples[frame]
+            # PoseBone.matrix assignment needs a dependency update before its
+            # local channels are read. Without it, frame 1 can retain the old
+            # static equipment pose even though later frames look correct.
+            for bone in equipment.data.bones:
+                source_name = bone_map.get(bone.name)
+                if not source_name or source_name not in matrices:
+                    continue
+                pose_bone = equipment.pose.bones[bone.name]
+                pose_bone.rotation_mode = "QUATERNION"
+                pose_bone.matrix = matrices[source_name]
+                context.view_layer.update()
+                pose_bone.keyframe_insert("location", frame=frame, group="HUMANOID_ANCHORS")
+                pose_bone.keyframe_insert("rotation_quaternion", frame=frame, group="HUMANOID_ANCHORS")
+                pose_bone.keyframe_insert("scale", frame=frame, group="HUMANOID_ANCHORS")
+
+            phase = 2.0 * math.pi * index / max(1, len(frames) - 1)
+            if equipment_type == "HAIR":
+                driver = source_roles.get("head", "Head")
+                strength = hair_strength
+                max_x, max_z = math.radians(8.0), math.radians(6.0)
+            else:
+                driver = source_roles.get("hips", "Hips")
+                strength = skirt_strength
+                max_x, max_z = math.radians(6.0), math.radians(5.0)
+
+            for chain_index, chain in enumerate(chains):
+                side = -1.0 if chain_index % 2 else 1.0
+                for level, bone_name in enumerate(chain):
+                    pose_bone = equipment.pose.bones.get(bone_name)
+                    if pose_bone is None:
+                        continue
+                    delta = delayed_delta(driver, index, 2 + level * (2 if equipment_type == "HAIR" else 1))
+                    gain = (0.38 + 0.25 * level) if equipment_type == "HAIR" else (0.30 + 0.24 * level)
+                    if equipment_type == "HAIR":
+                        idle_x = math.radians(0.35 + 0.22 * level) * math.sin(phase + chain_index * 0.47)
+                        idle_z = math.radians(0.25 + 0.18 * level) * math.sin(phase * 2.0 + chain_index * 0.61)
+                    else:
+                        idle_x = math.radians(0.62 + 0.66 * level) * math.sin(phase + chain_index * 0.72)
+                        idle_z = math.radians(0.40 + 0.44 * level) * math.sin(phase * 2.0 + chain_index * 0.53)
+                    x = max(-max_x, min(max_x, (-delta.x * gain + idle_x) * strength))
+                    z = max(-max_z, min(max_z, (-delta.z * gain + idle_z * side) * strength))
+                    pose_bone.rotation_mode = "XYZ"
+                    pose_bone.rotation_euler = (x, 0.0, z)
+                    pose_bone.keyframe_insert("rotation_euler", frame=frame, group="DYNAMIC_SECONDARY")
+
+        if looped:
+            for curve in action.fcurves:
+                if not any(modifier.type == "CYCLES" for modifier in curve.modifiers):
+                    curve.modifiers.new("CYCLES")
+
+        max_dynamic_angle = 0.0
+        max_anchor_error = 0.0
+        critical_roles = ("head", "chest", "hips", "thigh_l", "thigh_r")
+        target_roles = _json_property(equipment, "gsmb_canonical_mapping", {})
+        for frame in frames:
+            scene.frame_set(frame)
+            for chain in chains:
+                for bone_name in chain:
+                    pose_bone = equipment.pose.bones.get(bone_name)
+                    if pose_bone:
+                        max_dynamic_angle = max(
+                            max_dynamic_angle,
+                            abs(pose_bone.rotation_euler.x),
+                            abs(pose_bone.rotation_euler.z),
+                        )
+            for role in critical_roles:
+                target_name = target_roles.get(role)
+                source_name = source_roles.get(role)
+                if target_name not in equipment.pose.bones or source_name not in source.pose.bones:
+                    continue
+                target_matrix = equipment.matrix_world @ equipment.pose.bones[target_name].matrix
+                source_matrix = source.matrix_world @ source.pose.bones[source_name].matrix
+                max_anchor_error = max(
+                    max_anchor_error,
+                    (target_matrix.translation - source_matrix.translation).length,
+                )
+        if max_dynamic_angle < math.radians(0.05):
+            raise RuntimeError(f"{equipment.name}: generated secondary bones are static")
+        if max_anchor_error > 1e-3:
+            raise RuntimeError(f"{equipment.name}: anchor drift is {max_anchor_error:.6f} m")
+        action["gsmb_anchor_max_error_m"] = max_anchor_error
+        action["gsmb_dynamic_max_angle_deg"] = math.degrees(max_dynamic_angle)
+        results.append({
+            "equipment": equipment.name,
+            "action": action.name,
+            "dynamic_bones": sum(len(chain) for chain in chains),
+            "max_angle_deg": math.degrees(max_dynamic_angle),
+            "anchor_error_m": max_anchor_error,
+        })
+
+    scene.frame_set(start)
+    return results
+
+
+def kimodo_secondary_timer():
+    """Observe Rokoko/Kimodo completion without coupling either addon."""
+    global _KIMODO_SECONDARY_BUSY
+    if _KIMODO_SECONDARY_BUSY:
+        return 1.0
+    for scene in bpy.data.scenes:
+        settings = getattr(scene, "rro_bridge", None)
+        if settings is None or not getattr(scene, "gsmb_kimodo_auto_secondary", True):
+            continue
+        request_id = settings.last_completed_request_id
+        if not request_id or scene.get("gsmb_last_kimodo_secondary_request") == request_id:
+            continue
+        source = settings.target_object
+        if source is None or source.type != "ARMATURE" or not _equipment_for_source(source):
+            scene["gsmb_last_kimodo_secondary_request"] = request_id
+            continue
+        # Mark before work to prevent repeated retries if a malformed asset fails.
+        scene["gsmb_last_kimodo_secondary_request"] = request_id
+        try:
+            _KIMODO_SECONDARY_BUSY = True
+            results = bake_secondary_actions(
+                bpy.context,
+                source,
+                hair_strength=scene.gsmb_kimodo_hair_strength,
+                skirt_strength=scene.gsmb_kimodo_skirt_strength,
+            )
+            scene["gsmb_prod_status"] = (
+                f"Kimodo secondary baked: {len(results)} equipment rig(s), request {request_id}"
+            )
+        except Exception as exc:
+            scene["gsmb_prod_status"] = f"Kimodo secondary failed: {exc}"
+            print("GSMB Kimodo secondary:", exc)
+        finally:
+            _KIMODO_SECONDARY_BUSY = False
+    return 1.0
 
 
 def _clone_armature(source, name, collection):
@@ -1198,6 +1441,36 @@ class GSMB_OT_validate_production_equipment(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GSMB_OT_bake_action_secondary(bpy.types.Operator):
+    bl_idname = "gsmb.bake_action_secondary"
+    bl_label = "为当前动作烘焙头发/裙摆"
+    bl_description = "同步主骨架动作到独立装备锚点，并为头发和裙摆生成循环安全的次级预览 Action"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        source = _source_armature(context)
+        if source is None:
+            self.report({"ERROR"}, "请选择带动画的主角色骨架")
+            return {"CANCELLED"}
+        try:
+            results = bake_secondary_actions(
+                context,
+                source,
+                hair_strength=context.scene.gsmb_kimodo_hair_strength,
+                skirt_strength=context.scene.gsmb_kimodo_skirt_strength,
+            )
+        except Exception as exc:
+            context.scene["gsmb_prod_status"] = f"次级动画烘焙失败：{exc}"
+            self.report({"ERROR"}, context.scene["gsmb_prod_status"])
+            return {"CANCELLED"}
+        context.scene["gsmb_prod_status"] = (
+            f"已烘焙 {len(results)} 套装备次级动画；"
+            + "，".join(f"{item['equipment']} {item['max_angle_deg']:.1f}°" for item in results)
+        )
+        self.report({"INFO"}, context.scene["gsmb_prod_status"])
+        return {"FINISHED"}
+
+
 class GSMB_PT_production(bpy.types.Panel):
     bl_label = "Production Dynamic Equipment"
     bl_idname = "GSMB_PT_production"
@@ -1259,6 +1532,13 @@ class GSMB_PT_production(bpy.types.Panel):
         package.label(text="Production package")
         package.prop(scene, "gsmb_prod_package_dir")
         package.operator("gsmb.export_dynamic_equipment_package", icon="PACKAGE")
+        kimodo = layout.box()
+        kimodo.label(text="Kimodo / 动作预览", icon="ACTION")
+        kimodo.prop(scene, "gsmb_kimodo_auto_secondary")
+        row = kimodo.row(align=True)
+        row.prop(scene, "gsmb_kimodo_hair_strength")
+        row.prop(scene, "gsmb_kimodo_skirt_strength")
+        kimodo.operator("gsmb.bake_action_secondary", icon="REC")
         layout.label(text=scene.get("gsmb_prod_status", "Select rig + equipment mesh to begin"))
 
 
@@ -1269,6 +1549,7 @@ classes = (
     GSMB_OT_export_godot_profile,
     GSMB_OT_export_dynamic_equipment_package,
     GSMB_OT_validate_production_equipment,
+    GSMB_OT_bake_action_secondary,
     GSMB_PT_production,
 )
 
@@ -1334,6 +1615,19 @@ def register():
     bpy.types.Scene.gsmb_prod_package_dir = bpy.props.StringProperty(
         name="Package Directory", default="//exports/", subtype="DIR_PATH",
     )
+    bpy.types.Scene.gsmb_kimodo_auto_secondary = bpy.props.BoolProperty(
+        name="Kimodo 后自动生成头发/裙摆预览",
+        description="Kimodo 完成主骨架绑定后，自动同步装备锚点并烘焙次级 Action",
+        default=True,
+    )
+    bpy.types.Scene.gsmb_kimodo_hair_strength = bpy.props.FloatProperty(
+        name="头发", default=1.0, min=0.0, max=3.0,
+    )
+    bpy.types.Scene.gsmb_kimodo_skirt_strength = bpy.props.FloatProperty(
+        name="裙摆", default=1.0, min=0.0, max=3.0,
+    )
+    if not bpy.app.timers.is_registered(kimodo_secondary_timer):
+        bpy.app.timers.register(kimodo_secondary_timer, first_interval=1.0, persistent=True)
 
 
 def unregister():
@@ -1346,7 +1640,10 @@ def unregister():
         "gsmb_prod_gravity", "gsmb_prod_radius", "gsmb_prod_head_bone",
         "gsmb_prod_chest_bone", "gsmb_prod_hips_bone", "gsmb_prod_thigh_l_bone",
         "gsmb_prod_thigh_r_bone", "gsmb_prod_export_path", "gsmb_prod_package_dir",
+        "gsmb_kimodo_auto_secondary", "gsmb_kimodo_hair_strength", "gsmb_kimodo_skirt_strength",
     )
+    if bpy.app.timers.is_registered(kimodo_secondary_timer):
+        bpy.app.timers.unregister(kimodo_secondary_timer)
     for name in names:
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)

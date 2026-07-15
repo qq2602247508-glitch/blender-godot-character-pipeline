@@ -111,5 +111,24 @@ character has an armature. In Hair / From Guides mode:
 4. Edit the generated curve if needed and repeat for each major lock.
 5. After the humanoid rig exists, build the hair equipment from those guides.
 
+## Kimodo animation preview
+
+Dynamic hair and skirts use independent equipment armatures, so assigning a
+Kimodo/retargeted Action to the hero armature alone is not enough for a Blender
+preview. Version 1.7.3 watches the installed Rokoko/Kimodo bridge completion id.
+After a successful bind it automatically:
+
+1. finds equipment whose `gsmb_source_armature` points to the Kimodo target;
+2. bakes the hero pose into the equipment-local humanoid anchors;
+3. creates separate loop-safe hair/skirt secondary Actions;
+4. rejects the bake when critical anchor drift exceeds 1 mm or all dynamic
+   bones remain static.
+
+The behavior is enabled by default in **Production Dynamic Equipment → Kimodo /
+动作预览**. The same box contains a manual **为当前动作烘焙头发/裙摆** fallback and
+separate hair/skirt strength controls. These Actions are Blender previews only;
+Godot runtime assets still use `SpringBoneSimulator3D` and do not bake equipment
+tracks into humanoid animation clips.
+
 Simple ponytails can still use automatic distribution. Guide-driven weighting
 assigns each vertex to the closest chain and keeps the four-influence limit.
