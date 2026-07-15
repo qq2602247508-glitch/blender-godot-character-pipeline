@@ -89,6 +89,21 @@ def _clone_armature(source, name, collection):
     collection.objects.link(armature)
     armature.matrix_world = source.matrix_world.copy()
     armature.show_in_front = True
+    # FBX rigs can carry their authored bind display pose in PoseBone
+    # matrix_basis instead of identity.  Copy it to the equipment-local rig;
+    # otherwise a Hunyuan/Mixamo source can snap back to its raw rest pose as
+    # soon as the dynamic equipment is generated.
+    bpy.context.view_layer.update()
+    for source_bone in source.pose.bones:
+        target_bone = armature.pose.bones.get(source_bone.name)
+        if target_bone is not None:
+            target_bone.matrix_basis = source_bone.matrix_basis.copy()
+    if any(abs(value - 1.0) > 1e-6 for value in armature.scale):
+        for selected in list(bpy.context.selected_objects):
+            selected.select_set(False)
+        armature.select_set(True)
+        bpy.context.view_layer.objects.active = armature
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
     armature["gsmb_production_equipment"] = True
     armature["gsmb_source_armature"] = source.name
     return armature
@@ -156,11 +171,37 @@ def _group(mesh, name):
 
 def _add_normalized_weights(mesh, vertex_index, weights):
     filtered = [(name, max(0.0, weight)) for name, weight in weights if weight > 1e-6]
+    filtered.sort(key=lambda item: item[1], reverse=True)
+    filtered = filtered[:4]
     total = sum(weight for _, weight in filtered)
     if total <= 1e-8:
         return
     for name, weight in filtered:
         _group(mesh, name).add([vertex_index], weight / total, "REPLACE")
+
+
+def _capture_deform_weights(mesh, armature):
+    """Preserve the imported body skin so fixed roots do not snap on FBX rigs."""
+    deform_names = {bone.name for bone in armature.data.bones if bone.use_deform}
+    group_names = {group.index: group.name for group in mesh.vertex_groups}
+    captured = []
+    for vertex in mesh.data.vertices:
+        weights = [
+            (group_names[element.group], element.weight)
+            for element in vertex.groups
+            if group_names.get(element.group) in deform_names and element.weight > 1e-6
+        ]
+        captured.append(weights)
+    return captured
+
+
+def _fixed_root_weights(base_weights, vertex_index, fallback_bone, factor):
+    if factor <= 1e-6:
+        return []
+    authored = base_weights[vertex_index] if base_weights else []
+    if authored:
+        return [(name, weight * factor) for name, weight in authored]
+    return [(fallback_bone, factor)]
 
 
 def _linear_pair(value, count):
@@ -175,7 +216,7 @@ def _linear_pair(value, count):
     return ((first, 1.0 - blend), (second, blend))
 
 
-def _weight_hair(mesh, armature, chains, parent_bone):
+def _weight_hair(mesh, armature, chains, parent_bone, base_weights=None):
     points = _mesh_points_in_armature(mesh, armature)
     minimum, maximum = _bounds(points)
     height = max(1e-6, maximum.z - minimum.z)
@@ -186,7 +227,7 @@ def _weight_hair(mesh, armature, chains, parent_bone):
         chain_pairs = _linear_pair(across, len(chains))
         root_weight = max(0.0, 1.0 - down / 0.18)
         secondary_scale = 1.0 - root_weight
-        weights = [(parent_bone, root_weight)]
+        weights = _fixed_root_weights(base_weights, vertex.index, parent_bone, root_weight)
         for chain_index, chain_weight in chain_pairs:
             if root_weight > 0.0:
                 weights.append((chains[chain_index][0], secondary_scale * chain_weight))
@@ -199,17 +240,32 @@ def _weight_hair(mesh, armature, chains, parent_bone):
 def _base_object_name(name):
     """Return a stable source name for Blender copies used in preview rigs."""
     value = re.sub(r"\.\d{3}$", "", name or "")
-    for prefix in ("GSMB_TEST_", "GSMB_PREVIEW_", "GSMB_COPY_"):
-        if value.startswith(prefix):
-            value = value[len(prefix):]
-            break
+    # Copies can pass through several pipeline stages, for example
+    # GAME_RIGGED_part_11.  Strip every recognized wrapper until the stable
+    # authored source name remains so guides continue to belong to their mesh.
+    prefixes = (
+        "GSMB_TEST_", "GSMB_PREVIEW_", "GSMB_COPY_",
+        "GAME_", "RIGGED_", "HUNYUAN_OPT_",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if value.startswith(prefix):
+                value = value[len(prefix):]
+                changed = True
+                break
     return value
 
 
 def _guide_matches_mesh(mesh, source_name):
     if not source_name:
         return False
-    explicit = mesh.get("gsmb_source_mesh") or mesh.get("gsmb_original_mesh")
+    explicit = (
+        mesh.get("gsmb_source_mesh")
+        or mesh.get("gsmb_original_mesh")
+        or mesh.get("gsmb_source_part")
+    )
     candidates = {
         _base_object_name(mesh.name),
         _base_object_name(mesh.data.name),
@@ -221,6 +277,74 @@ def _guide_matches_mesh(mesh, source_name):
 def _chain_points(armature, chain):
     bones = [armature.data.bones[name] for name in chain]
     return [bone.head_local.copy() for bone in bones] + [bones[-1].tail_local.copy()]
+
+
+def _blended_deform_matrix(armature, weights):
+    valid = [
+        (name, weight) for name, weight in weights
+        if weight > 1e-6
+        and armature.data.bones.get(name) is not None
+        and armature.pose.bones.get(name) is not None
+    ]
+    total = sum(weight for _, weight in valid)
+    if total <= 1e-8:
+        return None
+    result = Matrix(((0.0, 0.0, 0.0, 0.0),) * 4)
+    for name, weight in valid:
+        bone = armature.data.bones[name]
+        deform = armature.pose.bones[name].matrix @ bone.matrix_local.inverted_safe()
+        result += deform * (weight / total)
+    return result
+
+
+def _match_secondary_bind_pose(
+    armature, chains, meshes=None, base_weights=None, chain_sources=None
+):
+    """Make new chains neutral under a non-identity imported FBX pose.
+
+    Hunyuan/Mixamo FBX files can store the authored bind display in pose-bone
+    bases.  Bones appended later in Edit Mode start with identity pose bases,
+    which otherwise moves the equipment before any spring simulation runs.
+    """
+    mesh_points = {
+        mesh.name: _mesh_points_in_armature(mesh, armature)
+        for mesh in (meshes or [])
+    }
+    for chain_index, chain in enumerate(chains):
+        source_name = chain_sources[chain_index] if chain_sources else ""
+        source_mesh = next(
+            (mesh for mesh in (meshes or []) if _guide_matches_mesh(mesh, source_name)),
+            None,
+        )
+        for bone_name in chain:
+            bone = armature.data.bones[bone_name]
+            parent = bone.parent
+            if parent is None:
+                continue
+            deform = None
+            candidates = [source_mesh] if source_mesh is not None else list(meshes or [])
+            nearest = None
+            for mesh in candidates:
+                points = mesh_points[mesh.name]
+                vertex_index = min(
+                    range(len(points)),
+                    key=lambda index: (points[index] - bone.head_local).length_squared,
+                )
+                distance = (points[vertex_index] - bone.head_local).length_squared
+                if nearest is None or distance < nearest[0]:
+                    nearest = (distance, mesh, vertex_index)
+            if nearest is not None and base_weights:
+                _, mesh, vertex_index = nearest
+                deform = _blended_deform_matrix(
+                    armature, base_weights[mesh.name][vertex_index]
+                )
+            if deform is None:
+                deform = (
+                    armature.pose.bones[parent.name].matrix
+                    @ parent.matrix_local.inverted_safe()
+                )
+            armature.pose.bones[bone_name].matrix = deform @ bone.matrix_local
+            bpy.context.view_layer.update()
 
 
 def _point_to_polyline(point, polyline):
@@ -309,7 +433,9 @@ def _surface_chain_weights(mesh, points, chain_points):
     return result, progress
 
 
-def _weight_hair_from_guides(mesh, armature, chains, parent_bone, chain_sources=None):
+def _weight_hair_from_guides(
+    mesh, armature, chains, parent_bone, chain_sources=None, base_weights=None
+):
     if chain_sources is None:
         eligible = list(range(len(chains)))
     else:
@@ -343,7 +469,7 @@ def _weight_hair_from_guides(mesh, armature, chains, parent_bone, chain_sources=
         )
         guide_root_pin = max(0.0, 1.0 - progress / 0.35)
         root_weight = max(scalp_pin, guide_root_pin)
-        weights = [(parent_bone, root_weight)]
+        weights = _fixed_root_weights(base_weights, vertex.index, parent_bone, root_weight)
         for chain_index, chain_weight, chain_progress in progress_by_chain:
             if root_weight > 0.0:
                 weights.append((
@@ -361,7 +487,7 @@ def _weight_hair_from_guides(mesh, armature, chains, parent_bone, chain_sources=
         _add_normalized_weights(mesh, vertex.index, weights)
 
 
-def _weight_skirt(mesh, armature, chains, parent_bone, center):
+def _weight_skirt(mesh, armature, chains, parent_bone, center, base_weights=None):
     points = _mesh_points_in_armature(mesh, armature)
     minimum, maximum = _bounds(points)
     height = max(1e-6, maximum.z - minimum.z)
@@ -375,7 +501,7 @@ def _weight_skirt(mesh, armature, chains, parent_bone, center):
         chain_blend = chain_position - math.floor(chain_position)
         root_weight = max(0.0, 1.0 - down / 0.16)
         secondary_scale = 1.0 - root_weight
-        weights = [(parent_bone, root_weight)]
+        weights = _fixed_root_weights(base_weights, vertex.index, parent_bone, root_weight)
         for chain_index, chain_weight in ((first_chain, 1.0 - chain_blend), (second_chain, chain_blend)):
             if root_weight > 0.0:
                 weights.append((chains[chain_index][0], secondary_scale * chain_weight))
@@ -754,6 +880,11 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
             self.report({"ERROR"}, f"Could not resolve the required {parent_role} bone")
             return {"CANCELLED"}
 
+        base_weights = {
+            mesh.name: _capture_deform_weights(mesh, armature)
+            for mesh in meshes
+        }
+
         for obj in context.selected_objects:
             obj.select_set(False)
         armature.select_set(True)
@@ -785,6 +916,10 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
             self.report({"ERROR"}, f"Secondary chain generation failed: {exc}")
             return {"CANCELLED"}
         bpy.ops.object.mode_set(mode="OBJECT")
+        _match_secondary_bind_pose(
+            armature, chains, meshes, base_weights, chain_sources
+            if equipment_type == "HAIR" else None,
+        )
 
         if equipment_type == "HAIR" and chain_sources is not None:
             unmatched = [
@@ -809,16 +944,22 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
             if equipment_type == "HAIR":
                 if scene.gsmb_hair_build_mode == "GUIDES":
                     _weight_hair_from_guides(
-                        mesh, armature, chains, parent_bone, chain_sources
+                        mesh, armature, chains, parent_bone, chain_sources,
+                        base_weights[mesh.name],
                     )
                     mesh["gsmb_source_mesh"] = next(
                         source_name for source_name in chain_sources
                         if _guide_matches_mesh(mesh, source_name)
                     )
                 else:
-                    _weight_hair(mesh, armature, chains, parent_bone)
+                    _weight_hair(
+                        mesh, armature, chains, parent_bone, base_weights[mesh.name]
+                    )
             else:
-                _weight_skirt(mesh, armature, chains, parent_bone, center)
+                _weight_skirt(
+                    mesh, armature, chains, parent_bone, center,
+                    base_weights[mesh.name],
+                )
 
         colliders = _create_standard_colliders(collection, armature, mapping, _armature_height(armature))
         try:
@@ -957,10 +1098,19 @@ class GSMB_OT_export_dynamic_equipment_package(bpy.types.Operator):
         profile_path = os.path.join(directory, f"{asset_id}.secondary_motion.json")
 
         previous_active = context.view_layer.objects.active
-        previous_selected = list(context.selected_objects)
+        previous_selected = [
+            obj for obj in context.view_layer.objects if obj.select_get()
+        ]
+        allowed = {armature, *meshes}
+        render_states = {obj: obj.hide_render for obj in bpy.data.objects}
         try:
-            for obj in context.selected_objects:
+            # Hidden objects can remain selected but are omitted from
+            # context.selected_objects.  Deselect the complete view layer so a
+            # hidden Hunyuan/reference mesh cannot leak into an equipment GLB.
+            for obj in context.view_layer.objects:
                 obj.select_set(False)
+            for obj in bpy.data.objects:
+                obj.hide_render = obj not in allowed
             armature.select_set(True)
             for mesh in meshes:
                 mesh.select_set(True)
@@ -969,6 +1119,8 @@ class GSMB_OT_export_dynamic_equipment_package(bpy.types.Operator):
                 filepath=glb_path,
                 export_format="GLB",
                 use_selection=True,
+                use_active_scene=True,
+                use_renderable=True,
                 export_animations=False,
                 export_skins=True,
                 export_all_influences=False,
@@ -980,7 +1132,10 @@ class GSMB_OT_export_dynamic_equipment_package(bpy.types.Operator):
             self.report({"ERROR"}, f"Dynamic equipment package export failed: {exc}")
             return {"CANCELLED"}
         finally:
-            for obj in context.selected_objects:
+            for obj, hidden in render_states.items():
+                if obj.name in bpy.data.objects:
+                    obj.hide_render = hidden
+            for obj in context.view_layer.objects:
                 obj.select_set(False)
             for obj in previous_selected:
                 if obj.name in bpy.data.objects:

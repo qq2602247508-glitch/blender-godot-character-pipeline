@@ -109,6 +109,9 @@ def main():
     for obj in list(scene.objects):
         bpy.data.objects.remove(obj, do_unlink=True)
     rig = build_rig(scene)
+    rig.pose.bones["mixamorig:Hips"].location.x = 0.02
+    source_pose_basis = rig.pose.bones["mixamorig:Hips"].matrix_basis.copy()
+    assert addon.production._base_object_name("GAME_RIGGED_part_11") == "part_11"
     source_a, rows_a = build_curved_hair(scene, "GuideHairA", -0.16)
     source_b, rows_b = build_curved_hair(scene, "GuideHairB", 0.16)
     create_guide(scene, source_a, rows_a, 0)
@@ -133,6 +136,11 @@ def main():
     scene.gsmb_prod_bones_per_chain = 4
     assert bpy.ops.gsmb.generate_production_equipment() == {"FINISHED"}
     equipment = scene.gsmb_prod_equipment_armature
+    target_pose_basis = equipment.pose.bones["Hips"].matrix_basis
+    assert max(
+        abs(target_pose_basis[row][column] - source_pose_basis[row][column])
+        for row in range(4) for column in range(4)
+    ) < 1e-7
     assert sum(1 for bone in equipment.data.bones if bone.get("gsmb_secondary")) == 12
     assert "Head" in equipment.data.bones
     for hair in (hair_a, hair_b):
