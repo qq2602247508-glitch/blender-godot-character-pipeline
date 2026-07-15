@@ -87,9 +87,19 @@ assert cloth.vertex_groups.get("Hips")
 assert min(cloth.vertex_groups["Hips"].weight(vertex.index) for vertex in cloth.data.vertices) > 0.99
 assert any(modifier.type == "ARMATURE" and modifier.object == rig for modifier in cloth.modifiers)
 
+fallback_mesh = mesh_object(
+    "layered_ai_fallback",
+    [(-0.2, -0.1, 0.2), (0.2, -0.1, 0.2), (0.2, 0.1, 1.8), (-0.2, 0.1, 1.8)],
+    [(0, 1, 2, 3)],
+)
+fallback_stats = addon.hero_rig._proximity_bind_weights(fallback_mesh, rig)
+assert fallback_stats["unweighted"] == 0
+assert fallback_stats["over_4"] == 0
+assert 1 <= fallback_stats["max_influences"] <= 4
+
 removed = addon.hero_rig._undo_last_landmark(scene)
 assert removed == "toe.L"
 assert bpy.data.objects.get("LM_toe.L_橙色圈") is None
 assert bpy.data.objects.get("LM_toe.R_橙色圈") is None
 
-print(f"GSMB_HERO_RIG_SMOKE_OK bones={len(rig.data.bones)} roles=1 masks=2 transfer=1 mirrored_markers=20 undo=1")
+print(f"GSMB_HERO_RIG_SMOKE_OK bones={len(rig.data.bones)} roles=1 masks=2 transfer=1 proximity_fallback=1 mirrored_markers=20 undo=1")

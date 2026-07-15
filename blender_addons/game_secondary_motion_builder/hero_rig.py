@@ -1,8 +1,10 @@
 """Landmark-driven humanoid rig and modular part authoring for game characters."""
 
 import json
+import math
 from math import pi
 from mathutils import Vector
+from mathutils.kdtree import KDTree
 
 import bpy
 from bpy_extras import view3d_utils
@@ -466,6 +468,94 @@ def _armature_modifier(obj, armature):
     return modifier
 
 
+def _weight_stats(obj, armature):
+    deform_names = {bone.name for bone in armature.data.bones if bone.use_deform}
+    index_to_name = {group.index: group.name for group in obj.vertex_groups}
+    unweighted = 0
+    over_limit = 0
+    max_influences = 0
+    for vertex in obj.data.vertices:
+        influences = sum(
+            1 for assignment in vertex.groups
+            if assignment.weight > 1e-6 and index_to_name.get(assignment.group) in deform_names
+        )
+        if influences == 0:
+            unweighted += 1
+        if influences > 4:
+            over_limit += 1
+        max_influences = max(max_influences, influences)
+    return {
+        "vertices": len(obj.data.vertices),
+        "unweighted": unweighted,
+        "over_4": over_limit,
+        "max_influences": max_influences,
+    }
+
+
+def _proximity_bind_weights(obj, armature, max_influences=4):
+    """Topology-independent fallback for layered/disconnected AI character meshes."""
+    bones = [bone for bone in armature.data.bones if bone.use_deform]
+    if not bones or not obj.data.vertices:
+        raise ValueError("角色模型或变形骨骼为空")
+
+    # Recreate only deform groups; keep GSMB_FIXED/GSMB_DYNAMIC and other author masks.
+    for bone in bones:
+        group = obj.vertex_groups.get(bone.name)
+        if group is not None:
+            obj.vertex_groups.remove(group)
+    groups = {bone.name: obj.vertex_groups.new(name=bone.name) for bone in bones}
+
+    armature_to_object = obj.matrix_world.inverted() @ armature.matrix_world
+    samples_per_bone = 9
+    tree = KDTree(len(bones) * samples_per_bone)
+    sample_bones = []
+    sample_index = 0
+    for bone_index, bone in enumerate(bones):
+        head = armature_to_object @ bone.head_local
+        tail = armature_to_object @ bone.tail_local
+        for step in range(samples_per_bone):
+            point = head.lerp(tail, step / (samples_per_bone - 1))
+            tree.insert(point, sample_index)
+            sample_bones.append(bone_index)
+            sample_index += 1
+    tree.balance()
+
+    character_scale = max(obj.dimensions) or 1.0
+    epsilon = character_scale * 0.008
+    buckets = {bone.name: {} for bone in bones}
+    query_count = min(len(sample_bones), max(32, max_influences * samples_per_bone * 2))
+    for vertex in obj.data.vertices:
+        nearest_by_bone = {}
+        for _point, sample_id, distance in tree.find_n(vertex.co, query_count):
+            bone_index = sample_bones[sample_id]
+            previous = nearest_by_bone.get(bone_index)
+            if previous is None or distance < previous:
+                nearest_by_bone[bone_index] = distance
+        nearest = sorted(nearest_by_bone.items(), key=lambda item: item[1])[:max_influences]
+        if not nearest:
+            continue
+        raw = [(bone_index, 1.0 / ((distance + epsilon) ** 2)) for bone_index, distance in nearest]
+        total = sum(weight for _bone_index, weight in raw) or 1.0
+        normalized = [(bone_index, weight / total) for bone_index, weight in raw]
+        # Quantization enables fast batch writes while remaining visually smooth.
+        rounded = [round(weight, 3) for _bone_index, weight in normalized]
+        correction = 1.0 - sum(rounded)
+        rounded[0] = max(0.0, min(1.0, rounded[0] + correction))
+        for (bone_index, _weight), weight in zip(normalized, rounded):
+            if weight <= 0.0:
+                continue
+            bone_name = bones[bone_index].name
+            buckets[bone_name].setdefault(weight, []).append(vertex.index)
+
+    for bone_name, weight_buckets in buckets.items():
+        group = groups[bone_name]
+        for weight, indices in weight_buckets.items():
+            group.add(indices, weight, "REPLACE")
+    obj.parent = armature
+    _armature_modifier(obj, armature)
+    return _weight_stats(obj, armature)
+
+
 class GSMB_OT_bind_selected_parts(bpy.types.Operator):
     bl_idname = "gsmb.bind_selected_parts"
     bl_label = "绑定所选部件"
@@ -482,6 +572,7 @@ class GSMB_OT_bind_selected_parts(bpy.types.Operator):
             self.report({"ERROR"}, "请选择要绑定的模型部件")
             return {"CANCELLED"}
         failures = []
+        fallback_count = 0
         for obj in meshes:
             role = obj.gsmb_part_role
             if role == "IGNORE":
@@ -511,10 +602,28 @@ class GSMB_OT_bind_selected_parts(bpy.types.Operator):
                 bpy.ops.object.parent_set(type="ARMATURE_AUTO", keep_transform=True)
                 # Blender creates the modifier as part of ARMATURE_AUTO.
                 _armature_modifier(obj, armature)
+                stats = _weight_stats(obj, armature)
+                if stats["unweighted"] or stats["over_4"]:
+                    stats = _proximity_bind_weights(obj, armature, max_influences=4)
+                    fallback_count += 1
+                if stats["unweighted"] or stats["over_4"]:
+                    failures.append(
+                        f"{obj.name}: 未加权 {stats['unweighted']}，超过4骨 {stats['over_4']}"
+                    )
             except RuntimeError as error:
-                failures.append(f"{obj.name}: {error}")
+                try:
+                    stats = _proximity_bind_weights(obj, armature, max_influences=4)
+                    fallback_count += 1
+                    if stats["unweighted"] or stats["over_4"]:
+                        failures.append(
+                            f"{obj.name}: 未加权 {stats['unweighted']}，超过4骨 {stats['over_4']}"
+                        )
+                except (RuntimeError, ValueError) as fallback_error:
+                    failures.append(f"{obj.name}: {error}; {fallback_error}")
         if failures:
-            self.report({"WARNING"}, "部分自动权重失败，请改用“从身体迁移权重到衣服”")
+            self.report({"WARNING"}, "部分权重仍需手工检查：" + failures[0])
+        elif fallback_count:
+            self.report({"INFO"}, f"已绑定 {len(meshes)} 个部件；其中 {fallback_count} 个使用 AI 模型安全权重")
         else:
             self.report({"INFO"}, f"已绑定 {len(meshes)} 个部件")
         return {"FINISHED"}

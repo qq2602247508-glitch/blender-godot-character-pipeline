@@ -45,7 +45,7 @@ The production builder accepts Mixamo-like bone names and exports Godot `Skeleto
 1. Select the complete base character mesh and click **Start / Reset Landmark Rigging**.
 2. From a front orthographic view, click pelvis, chest, neck, head, then the left shoulder/arm/leg landmarks shown in the Chinese status line. A live orange ring and center dot confirm the hit position; placed rings remain visible and the right side appears automatically. `Ctrl+Z` removes the last point and its mirror; the 3D Cursor button is the manual fallback.
 3. Click **Build HERO_RIG_V2 + Fingers**. The generated deform skeleton has 54 bones, including three segments for all ten fingers.
-4. Classify modular meshes as body, fixed replacement, rigid accessory, hair, skirt/cape, or ignored. **Bind Selected Parts** uses automatic weights for ordinary skinned parts and nearest-bone parenting for rigid accessories.
+4. Classify modular meshes as body, fixed replacement, rigid accessory, hair, skirt/cape, or ignored. **Bind Selected Parts** first tries Blender automatic weights. If Bone Heat silently fails on layered/disconnected AI meshes, the add-on detects empty or invalid groups and switches to normalized bone-segment proximity weights with at most four influences. Rigid accessories use nearest-bone parenting.
 5. Keep one approved weighted base body. For later clothes and shoes, select the new parts and use **Transfer Body Weights to Clothes**, then correct only difficult joints in Weight Paint.
 6. Hair and skirt/cape parts use editable `GSMB_FIXED` and `GSMB_DYNAMIC` vertex groups. Run **Auto Fixed / Dynamic Mask**, then override selected vertices with the Fixed/Dynamic buttons before sending the part to Production Dynamic Equipment.
 
