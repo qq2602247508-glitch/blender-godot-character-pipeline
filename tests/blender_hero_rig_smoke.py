@@ -37,6 +37,11 @@ points = {
     "ankle.L": (0.17, 0, 0.08), "toe.L": (0.17, -0.15, 0.03),
 }
 scene["gsmb_hero_landmarks"] = json.dumps(points)
+addon.hero_rig._sync_markers(scene, addon.hero_rig._points(scene))
+assert bpy.data.objects.get("LM_shoulder.L_橙色圈")
+assert bpy.data.objects.get("LM_shoulder.R_橙色圈")
+assert bpy.data.objects.get("LM_shoulder.L_中心点")
+assert len(bpy.data.collections["GSMB_HERO_LANDMARKS"].objects) == 40
 assert bpy.ops.gsmb.build_hero_rig() == {"FINISHED"}
 rig = scene.gsmb_hero_armature
 required = {
@@ -82,4 +87,9 @@ assert cloth.vertex_groups.get("Hips")
 assert min(cloth.vertex_groups["Hips"].weight(vertex.index) for vertex in cloth.data.vertices) > 0.99
 assert any(modifier.type == "ARMATURE" and modifier.object == rig for modifier in cloth.modifiers)
 
-print(f"GSMB_HERO_RIG_SMOKE_OK bones={len(rig.data.bones)} roles=1 masks=2 transfer=1")
+removed = addon.hero_rig._undo_last_landmark(scene)
+assert removed == "toe.L"
+assert bpy.data.objects.get("LM_toe.L_橙色圈") is None
+assert bpy.data.objects.get("LM_toe.R_橙色圈") is None
+
+print(f"GSMB_HERO_RIG_SMOKE_OK bones={len(rig.data.bones)} roles=1 masks=2 transfer=1 mirrored_markers=20 undo=1")
