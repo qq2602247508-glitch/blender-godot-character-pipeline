@@ -131,6 +131,15 @@ def _ensure_modifier(mesh, armature):
         mesh.modifiers.remove(extra)
 
 
+def _parent_mesh_to_armature(mesh, armature):
+    """Keep the authored world transform while producing a glTF skin hierarchy."""
+    world_matrix = mesh.matrix_world.copy()
+    mesh.parent = armature
+    mesh.parent_type = "OBJECT"
+    mesh.matrix_parent_inverse = armature.matrix_world.inverted_safe()
+    mesh.matrix_world = world_matrix
+
+
 def _clear_deform_groups(mesh, armature):
     deform_names = {bone.name for bone in armature.data.bones if bone.use_deform}
     for group in list(mesh.vertex_groups):
@@ -383,6 +392,7 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
         for mesh in meshes:
             _clear_deform_groups(mesh, armature)
             _ensure_modifier(mesh, armature)
+            _parent_mesh_to_armature(mesh, armature)
             mesh["gsmb_dynamic_equipment"] = True
             mesh["gsmb_equipment_rig"] = armature.name
             if equipment_type == "HAIR":
@@ -492,6 +502,68 @@ class GSMB_OT_export_godot_profile(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GSMB_OT_export_dynamic_equipment_package(bpy.types.Operator):
+    bl_idname = "gsmb.export_dynamic_equipment_package"
+    bl_label = "Export GLB + Godot Profile"
+    bl_description = "Export the generated equipment rig/meshes as GLB and its runtime profile as JSON"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        armature = _equipment_armature(context)
+        if armature is None:
+            self.report({"ERROR"}, "Choose a generated production equipment armature")
+            return {"CANCELLED"}
+        meshes = [
+            obj for obj in bpy.data.objects
+            if obj.type == "MESH" and obj.get("gsmb_equipment_rig") == armature.name
+        ]
+        if not meshes:
+            self.report({"ERROR"}, "No equipment mesh references the generated rig")
+            return {"CANCELLED"}
+        directory = bpy.path.abspath(context.scene.gsmb_prod_package_dir)
+        os.makedirs(directory, exist_ok=True)
+        asset_id = _safe_id(armature.get("gsmb_asset_id", armature.name))
+        glb_path = os.path.join(directory, f"{asset_id}.glb")
+        profile_path = os.path.join(directory, f"{asset_id}.secondary_motion.json")
+
+        previous_active = context.view_layer.objects.active
+        previous_selected = list(context.selected_objects)
+        try:
+            for obj in context.selected_objects:
+                obj.select_set(False)
+            armature.select_set(True)
+            for mesh in meshes:
+                mesh.select_set(True)
+            context.view_layer.objects.active = armature
+            bpy.ops.export_scene.gltf(
+                filepath=glb_path,
+                export_format="GLB",
+                use_selection=True,
+                export_animations=False,
+                export_skins=True,
+                export_all_influences=False,
+            )
+            with open(profile_path, "w", encoding="utf-8") as handle:
+                json.dump(_profile(armature), handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+        except Exception as exc:
+            self.report({"ERROR"}, f"Dynamic equipment package export failed: {exc}")
+            return {"CANCELLED"}
+        finally:
+            for obj in context.selected_objects:
+                obj.select_set(False)
+            for obj in previous_selected:
+                if obj.name in bpy.data.objects:
+                    obj.select_set(True)
+            if previous_active and previous_active.name in bpy.data.objects:
+                context.view_layer.objects.active = previous_active
+
+        context.scene.gsmb_prod_export_path = profile_path
+        context.scene["gsmb_prod_status"] = f"Package exported: {glb_path} + {profile_path}"
+        self.report({"INFO"}, context.scene["gsmb_prod_status"])
+        return {"FINISHED"}
+
+
 class GSMB_OT_validate_production_equipment(bpy.types.Operator):
     bl_idname = "gsmb.validate_production_equipment"
     bl_label = "Validate Dynamic Equipment"
@@ -583,12 +655,17 @@ class GSMB_PT_production(bpy.types.Panel):
         layout.operator("gsmb.validate_production_equipment", icon="CHECKMARK")
         layout.prop(scene, "gsmb_prod_export_path")
         layout.operator("gsmb.export_godot_profile", icon="EXPORT")
+        package = layout.box()
+        package.label(text="Production package")
+        package.prop(scene, "gsmb_prod_package_dir")
+        package.operator("gsmb.export_dynamic_equipment_package", icon="PACKAGE")
         layout.label(text=scene.get("gsmb_prod_status", "Select rig + equipment mesh to begin"))
 
 
 classes = (
     GSMB_OT_generate_production_equipment,
     GSMB_OT_export_godot_profile,
+    GSMB_OT_export_dynamic_equipment_package,
     GSMB_OT_validate_production_equipment,
     GSMB_PT_production,
 )
@@ -628,6 +705,9 @@ def register():
     bpy.types.Scene.gsmb_prod_export_path = bpy.props.StringProperty(
         name="Godot Profile", default="//secondary_motion.json", subtype="FILE_PATH",
     )
+    bpy.types.Scene.gsmb_prod_package_dir = bpy.props.StringProperty(
+        name="Package Directory", default="//exports/", subtype="DIR_PATH",
+    )
 
 
 def unregister():
@@ -637,7 +717,7 @@ def unregister():
         "gsmb_prod_bones_per_chain", "gsmb_prod_stiffness", "gsmb_prod_drag",
         "gsmb_prod_gravity", "gsmb_prod_radius", "gsmb_prod_head_bone",
         "gsmb_prod_chest_bone", "gsmb_prod_hips_bone", "gsmb_prod_thigh_l_bone",
-        "gsmb_prod_thigh_r_bone", "gsmb_prod_export_path",
+        "gsmb_prod_thigh_r_bone", "gsmb_prod_export_path", "gsmb_prod_package_dir",
     )
     for name in names:
         if hasattr(bpy.types.Scene, name):

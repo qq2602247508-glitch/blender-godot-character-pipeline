@@ -40,6 +40,25 @@ Each dynamic item produces:
 - one `*.secondary_motion.json` profile;
 - one equipment definition resource in the game project.
 
+The Blender add-on's **Export Godot Equipment Package** button writes the GLB
+and JSON pair with the same asset identifier. In Godot, create a
+`GSMBEquipmentDefinition` resource, assign its imported scene and JSON path,
+then pass it to `GSMBEquipmentManager.equip()`.
+
+## Runtime equipment manager
+
+Attach `GSMBEquipmentManager` under the character and set `main_skeleton_path`.
+Definitions choose one of three paths automatically:
+
+- `RIGID`: creates a `BoneAttachment3D` on `attachment_bone`;
+- `SHARED_SKINNED`: instances the scene and points every `MeshInstance3D` to
+  the main skeleton;
+- `DYNAMIC`: places `GSMBDynamicEquipment` directly under the main skeleton,
+  loads the secondary-motion JSON, and resets its spring simulation.
+
+`hide_body_regions` is reference-counted, so overlapping equipment does not
+reveal a body section until every item covering that section is removed.
+
 The JSON preserves source bone names for diagnostics but uses Godot humanoid names for collider bindings.
 
 ## Validation gates

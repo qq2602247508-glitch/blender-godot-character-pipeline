@@ -34,7 +34,7 @@ Dynamic hair / skirt / cape
 2. In `3D View > Secondary Motion > Production Dynamic Equipment`, choose the source humanoid armature.
 3. Select the armature and one or more hair/skirt meshes.
 4. Build and validate the dynamic equipment rig.
-5. Export the JSON profile next to the equipment GLB.
+5. Use **Export GLB + Godot Profile** to create a matched runtime package.
 
 The production builder accepts Mixamo-like bone names and exports Godot `SkeletonProfileHumanoid` names for the retarget/collider layer. Use Godot's BoneMap/Bone Renamer on import so both main and equipment humanoid bones use `Root`, `Hips`, `Chest`, `Head`, `LeftUpperLeg`, and related profile names.
 
@@ -50,10 +50,24 @@ Main Skeleton3D
 
 Assign the Blender-exported JSON to `GSMBDynamicEquipment.profile_path`. The component creates and configures `SpringBoneSimulator3D` and its bone-bound sphere/capsule colliders.
 
+For modular characters, add `GSMBEquipmentManager` below the character and
+create one `GSMBEquipmentDefinition` resource per item. The manager handles
+`BoneAttachment3D` accessories, meshes sharing the main skeleton, dynamic
+equipment-local skeletons, incompatible slots, and reference-counted body-part
+visibility.
+
 ## Tests
 
 ```bash
 /Applications/Godot.app/Contents/MacOS/Godot \
   --headless --path . \
   --script tests/godot_smoke/test_dynamic_equipment.gd
+
+/Applications/Godot.app/Contents/MacOS/Godot \
+  --headless --path . \
+  --script tests/godot_smoke/test_equipment_manager.gd
+
+/Applications/Blender.app/Contents/MacOS/Blender \
+  --background --factory-startup \
+  --python tests/blender_smoke.py
 ```

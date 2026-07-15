@@ -91,10 +91,15 @@ def main():
     assert bpy.ops.gsmb.generate_production_equipment() == {"FINISHED"}
     equipment = scene.gsmb_prod_equipment_armature
     assert equipment is not None
+    assert skirt.parent == equipment
     assert sum(1 for bone in equipment.data.bones if bone.get("gsmb_secondary")) == 24
     assert max(len(vertex.groups) for vertex in skirt.data.vertices) <= 4
     assert bpy.ops.gsmb.validate_production_equipment() == {"FINISHED"}
     assert bpy.ops.gsmb.export_godot_profile() == {"FINISHED"}
+    scene.gsmb_prod_package_dir = str(OUTPUT_ROOT)
+    assert bpy.ops.gsmb.export_dynamic_equipment_package() == {"FINISHED"}
+    assert (OUTPUT_ROOT / "skirt_headless_smoke.glb").stat().st_size > 0
+    assert (OUTPUT_ROOT / "skirt_headless_smoke.secondary_motion.json").stat().st_size > 0
 
     with open(scene.gsmb_prod_export_path, "r", encoding="utf-8") as handle:
         profile = json.load(handle)
