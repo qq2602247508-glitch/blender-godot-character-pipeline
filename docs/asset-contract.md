@@ -59,7 +59,10 @@ Definitions choose one of three paths automatically:
 `hide_body_regions` is reference-counted, so overlapping equipment does not
 reveal a body section until every item covering that section is removed.
 
-The JSON preserves source bone names for diagnostics but uses Godot humanoid names for collider bindings.
+The generated equipment rig automatically renames its five required anchors to
+`Head`, `Chest`, `Hips`, `LeftUpperLeg`, and `RightUpperLeg`. The source character
+is never renamed. JSON preserves source names for diagnostics while using Godot
+humanoid names for collider bindings.
 
 ## Validation gates
 

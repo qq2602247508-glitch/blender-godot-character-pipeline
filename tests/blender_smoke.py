@@ -92,6 +92,8 @@ def main():
     equipment = scene.gsmb_prod_equipment_armature
     assert equipment is not None
     assert skirt.parent == equipment
+    assert "Hips" in equipment.data.bones
+    assert "mixamorig:Hips" not in equipment.data.bones
     assert sum(1 for bone in equipment.data.bones if bone.get("gsmb_secondary")) == 24
     assert max(len(vertex.groups) for vertex in skirt.data.vertices) <= 4
     assert bpy.ops.gsmb.validate_production_equipment() == {"FINISHED"}
@@ -114,7 +116,7 @@ def main():
         if obj.get("gsmb_collider_role") == "hips" and obj.parent == equipment
     )
     before = hips_collider.matrix_world.translation.copy()
-    equipment.pose.bones["mixamorig:Hips"].location.x = 0.2
+    equipment.pose.bones["Hips"].location.x = 0.2
     bpy.context.view_layer.update()
     after = hips_collider.matrix_world.translation.copy()
     assert abs((after - before).x - 0.2) < 1e-5

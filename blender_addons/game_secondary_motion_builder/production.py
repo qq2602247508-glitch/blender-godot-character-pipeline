@@ -301,6 +301,41 @@ def _create_standard_colliders(collection, armature, mapping, scale):
     return colliders
 
 
+def _canonicalize_anchor_bones(armature, meshes, colliders, source_mapping):
+    """Rename required equipment anchors without touching the source rig."""
+    renamed = {}
+    for role, source_name in source_mapping.items():
+        target_name = GODOT_PROFILE_BONES[role]
+        if not source_name:
+            continue
+        bone = armature.data.bones.get(source_name)
+        if bone is None:
+            continue
+        existing = armature.data.bones.get(target_name)
+        if existing is not None and existing != bone:
+            raise ValueError(
+                f"Cannot canonicalize {source_name} to {target_name}: target already exists"
+            )
+        if source_name != target_name:
+            bone.name = target_name
+            for mesh in meshes:
+                group = mesh.vertex_groups.get(source_name)
+                if group is not None:
+                    group.name = target_name
+            renamed[source_name] = target_name
+
+    for collider in colliders:
+        source_name = collider.get("gsmb_bone", collider.parent_bone)
+        collider["gsmb_source_bone"] = source_name
+        canonical_name = renamed.get(source_name, source_name)
+        collider.parent_bone = canonical_name
+        collider["gsmb_bone"] = canonical_name
+    return {
+        role: GODOT_PROFILE_BONES[role] if source_mapping.get(role) else ""
+        for role in source_mapping
+    }
+
+
 def _armature_height(armature):
     points = []
     for bone in armature.data.bones:
@@ -401,6 +436,16 @@ class GSMB_OT_generate_production_equipment(bpy.types.Operator):
                 _weight_skirt(mesh, armature, chains, parent_bone, center)
 
         colliders = _create_standard_colliders(collection, armature, mapping, _armature_height(armature))
+        try:
+            canonical_mapping = _canonicalize_anchor_bones(
+                armature, meshes, colliders, mapping
+            )
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        armature["gsmb_canonical_mapping"] = json.dumps(
+            canonical_mapping, ensure_ascii=False
+        )
         armature["gsmb_collider_names"] = json.dumps([obj.name for obj in colliders], ensure_ascii=False)
         scene.gsmb_prod_equipment_armature = armature
         scene["gsmb_prod_status"] = (
@@ -449,7 +494,7 @@ def _profile(armature):
             colliders.append({
                 "name": obj.name,
                 "bone": GODOT_PROFILE_BONES.get(role, obj.get("gsmb_bone", "")),
-                "source_bone": obj.get("gsmb_bone", ""),
+                "source_bone": obj.get("gsmb_source_bone", obj.get("gsmb_bone", "")),
                 "role": role,
                 "shape": obj.get("gsmb_shape", "sphere"),
                 "radius": float(obj.get("gsmb_radius", 0.05)),

@@ -70,4 +70,15 @@ visibility.
 /Applications/Blender.app/Contents/MacOS/Blender \
   --background --factory-startup \
   --python tests/blender_smoke.py
+
+GSMB_REAL_MODEL=/path/to/Witch.gltf \
+/Applications/Blender.app/Contents/MacOS/Blender \
+  --background --factory-startup \
+  --python tests/blender_real_model_smoke.py
 ```
+
+The optional real-model regression uses Quaternius'
+[CC0 Ultimate Modular Women](https://quaternius.com/packs/ultimatemodularwomen.html)
+`Witch.gltf`. It non-destructively extracts a skirt test mesh from the modular
+body and exercises the complete package export without committing third-party
+asset files to this repository.
